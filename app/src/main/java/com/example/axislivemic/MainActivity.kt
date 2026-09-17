@@ -411,33 +411,14 @@ fun AxisLiveMicScreen() {
                                                     volumeReady =
                                                         true
 
-                                                    val range =
-                                                        info.maxGain -
-                                                                info.minGain
-
                                                     volume =
-                                                        if (
-                                                            range > 0
-                                                        ) {
-
-                                                            (
-                                                                    (
-                                                                            info.currentGain -
-                                                                                    info.minGain
-                                                                            ) /
-                                                                            range *
-                                                                            100.0
-                                                                    )
-                                                                .toFloat()
-                                                                .coerceIn(
-                                                                    0f,
-                                                                    100f
-                                                                )
-
-                                                        } else {
-
-                                                            50f
-                                                        }
+                                                        AxisSpeakerClient
+                                                            .gainToPercent(
+                                                                volumeInfo =
+                                                                    info,
+                                                                gain =
+                                                                    info.currentGain
+                                                            )
 
                                                 } else {
 

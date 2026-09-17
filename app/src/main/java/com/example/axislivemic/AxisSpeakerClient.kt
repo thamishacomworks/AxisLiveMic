@@ -9,7 +9,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
-import kotlin.math.roundToInt
+import kotlin.math.abs
+import kotlin.math.log10
+import kotlin.math.pow
 
 class AxisSpeakerClient {
 
@@ -24,6 +26,83 @@ class AxisSpeakerClient {
         val minGain: Double,
         val maxGain: Double
     )
+
+    companion object {
+
+        /*
+         * AXIS gain values are dB, so a straight
+         * percent -> gain mapping squeezes every audible
+         * level into the top of the slider.
+         *
+         * Percent is treated as amplitude instead:
+         *
+         *   dB = maxGain + 20 * log10(percent / 100)
+         *
+         * 100% = maxGain, 50% = -6 dB, 25% = -12 dB.
+         */
+        fun percentToGain(
+            volumeInfo: VolumeInfo,
+            percent: Int
+        ): Int {
+
+            if (volumeInfo.gainValues.isEmpty()) {
+                return volumeInfo.currentGain
+            }
+
+            val safePercent =
+                percent.coerceIn(0, 100)
+
+            if (safePercent == 0) {
+                return volumeInfo.gainValues.first()
+            }
+
+            val targetGain =
+                (
+                        volumeInfo.maxGain +
+                                20.0 *
+                                log10(
+                                    safePercent / 100.0
+                                )
+                        )
+                    .coerceIn(
+                        volumeInfo.minGain,
+                        volumeInfo.maxGain
+                    )
+
+            return volumeInfo
+                .gainValues
+                .minByOrNull {
+                    abs(it - targetGain)
+                }
+                ?: volumeInfo.gainValues.last()
+        }
+
+        /*
+         * Inverse of percentToGain, used to place the
+         * slider at the level the speaker is already on.
+         */
+        fun gainToPercent(
+            volumeInfo: VolumeInfo,
+            gain: Int
+        ): Float {
+
+            if (gain <= volumeInfo.minGain) {
+                return 0f
+            }
+
+            return (
+                    100.0 *
+                            10.0.pow(
+                                (
+                                        gain -
+                                                volumeInfo.maxGain
+                                        ) / 20.0
+                            )
+                    )
+                .toFloat()
+                .coerceIn(0f, 100f)
+        }
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
@@ -534,28 +613,11 @@ class AxisSpeakerClient {
                  * Map UI 0-100% to one of the gain values
                  * explicitly supported by this AXIS device.
                  */
-                val maxIndex =
-                    volumeInfo.gainValues.lastIndex
-
-                val gainIndex =
-                    if (maxIndex <= 0) {
-                        0
-                    } else {
-                        (
-                                safePercent /
-                                        100.0 *
-                                        maxIndex
-                                )
-                            .roundToInt()
-                            .coerceIn(
-                                0,
-                                maxIndex
-                            )
-                    }
-
                 val requestedGain =
-                    volumeInfo
-                        .gainValues[gainIndex]
+                    percentToGain(
+                        volumeInfo = volumeInfo,
+                        percent = safePercent
+                    )
 
                 /*
                  * Make a new deep copy.
