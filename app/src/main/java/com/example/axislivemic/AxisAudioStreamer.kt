@@ -26,6 +26,7 @@ class AxisAudioStreamer {
         ip: String,
         username: String,
         password: String,
+        contentType: String = "audio/basic",
         onStatus: (String) -> Unit
     ) {
         if (streaming) return
@@ -135,7 +136,7 @@ class AxisAudioStreamer {
                 val body = object : RequestBody() {
 
                     override fun contentType() =
-                        "audio/basic".toMediaType()
+                        contentType.toMediaType()
 
                     // Continuous stream.
                     override fun contentLength(): Long =
@@ -166,7 +167,7 @@ class AxisAudioStreamer {
                     )
                     .header(
                         "Content-Type",
-                        "audio/basic"
+                        contentType
                     )
                     .post(body)
                     .build()

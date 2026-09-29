@@ -10,8 +10,7 @@ import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
-import kotlin.math.log10
-import kotlin.math.pow
+import kotlin.math.roundToInt
 
 class AxisSpeakerClient {
 
@@ -24,21 +23,22 @@ class AxisSpeakerClient {
         val gainValues: List<Int>,
         val currentGain: Int,
         val minGain: Double,
-        val maxGain: Double
+        val maxGain: Double,
+        val useAudioControl: Boolean = false,
+        val currentPercent: Int? = null,
+        val masterMinVolume: Int = 0,
+        val masterMaxVolume: Int = 100
     )
 
     companion object {
 
         /*
-         * AXIS gain values are dB, so a straight
-         * percent -> gain mapping squeezes every audible
-         * level into the top of the slider.
+         * Linear across the supported gain range, the same
+         * way the speaker Web UI slider positions it:
          *
-         * Percent is treated as amplitude instead:
+         *   gain = minGain + (maxGain - minGain) * percent / 100
          *
-         *   dB = maxGain + 20 * log10(percent / 100)
-         *
-         * 100% = maxGain, 50% = -6 dB, 25% = -12 dB.
+         * so app 40% / 90% shows as 40% / 90% in the Web UI.
          */
         fun percentToGain(
             volumeInfo: VolumeInfo,
@@ -58,11 +58,9 @@ class AxisSpeakerClient {
 
             val targetGain =
                 (
-                        volumeInfo.maxGain +
-                                20.0 *
-                                log10(
-                                    safePercent / 100.0
-                                )
+                        volumeInfo.minGain +
+                                (volumeInfo.maxGain - volumeInfo.minGain) *
+                                safePercent / 100.0
                         )
                     .coerceIn(
                         volumeInfo.minGain,
@@ -86,18 +84,23 @@ class AxisSpeakerClient {
             gain: Int
         ): Float {
 
-            if (gain <= volumeInfo.minGain) {
-                return 0f
+            if (volumeInfo.currentPercent != null) {
+                return volumeInfo.currentPercent
+                    .toFloat()
+                    .coerceIn(0f, 100f)
+            }
+
+            val range =
+                volumeInfo.maxGain - volumeInfo.minGain
+
+            if (range <= 0.0) {
+                return 100f
             }
 
             return (
                     100.0 *
-                            10.0.pow(
-                                (
-                                        gain -
-                                                volumeInfo.maxGain
-                                        ) / 20.0
-                            )
+                            (gain - volumeInfo.minGain) /
+                            range
                     )
                 .toFloat()
                 .coerceIn(0f, 100f)
@@ -123,6 +126,14 @@ class AxisSpeakerClient {
     @Volatile
     private var savedDevicesJson: JSONArray? = null
 
+    /*
+     * True when the speaker decoder accepts 16 kHz
+     * "audio/axis-mulaw-128" (read in testConnection).
+     */
+    @Volatile
+    var supportsWideband: Boolean = false
+        private set
+
     /* =========================================================
        CONNECTION TEST
        ========================================================= */
@@ -147,6 +158,18 @@ class AxisSpeakerClient {
                 )
 
                 if (result.first) {
+
+                    supportsWideband =
+                        result.second.contains(
+                            "axis-mulaw-128",
+                            ignoreCase = true
+                        )
+
+                    Log.d(
+                        "AXIS_AUDIO",
+                        "Decoder = ${result.second.trim()} wideband=$supportsWideband"
+                    )
+
                     callback(
                         true,
                         "Connected to AXIS speaker"
@@ -184,6 +207,12 @@ class AxisSpeakerClient {
     ) {
         Thread {
             try {
+
+                /*
+                 * Control the same Output Gain the speaker's
+                 * own web UI uses (Audio Device Control).
+                 * That is the device's original volume.
+                 */
 
                 /* -----------------------------
                    GET CURRENT SETTINGS
@@ -269,6 +298,7 @@ class AxisSpeakerClient {
                 var signalingTypeId: String? = null
                 var channelId: Int? = null
                 var currentGain: Int? = null
+                var currentlyMuted = false
 
                 /* -----------------------------
                    FIND ACTIVE OUTPUT CHANNEL
@@ -398,6 +428,12 @@ class AxisSpeakerClient {
 
                                     currentGain =
                                         channel.optInt("gain")
+
+                                    currentlyMuted =
+                                        channel.optBoolean(
+                                            "mute",
+                                            false
+                                        )
 
                                     break@outer
                                 }
@@ -544,9 +580,12 @@ class AxisSpeakerClient {
                         maxGain =
                             gainValues
                                 .last()
-                                .toDouble()
+                                .toDouble(),
+                        currentPercent =
+                            if (currentlyMuted) 0
+                            else null
                     ),
-                    "Volume ready"
+                    "Volume ready (speaker output gain)"
                 )
 
             } catch (e: Exception) {
@@ -584,6 +623,9 @@ class AxisSpeakerClient {
         Thread {
             try {
 
+                val safePercent =
+                    percent.coerceIn(0, 100)
+
                 val saved =
                     savedDevicesJson
 
@@ -602,12 +644,6 @@ class AxisSpeakerClient {
                     )
                     return@Thread
                 }
-
-                val safePercent =
-                    percent.coerceIn(
-                        0,
-                        100
-                    )
 
                 /*
                  * Map UI 0-100% to one of the gain values
@@ -633,7 +669,8 @@ class AxisSpeakerClient {
                         volumeInfo =
                             volumeInfo,
                         newGain =
-                            requestedGain
+                            requestedGain,
+                        mute = safePercent == 0
                     )
 
                 if (!changed) {
@@ -772,7 +809,8 @@ class AxisSpeakerClient {
                             volumeInfo =
                                 volumeInfo,
                             newGain =
-                                actualGain
+                                actualGain,
+                            mute = safePercent == 0
                         )
 
                         savedDevicesJson =
@@ -809,13 +847,196 @@ class AxisSpeakerClient {
     }
 
     /* =========================================================
+       AXIS AUDIO CONTROL SERVICE (PREFERRED)
+       ========================================================= */
+
+    private fun tryGetAudioControlVolumeInfo(
+        ip: String,
+        username: String,
+        password: String
+    ): VolumeInfo? {
+        return try {
+            val capabilitiesResult =
+                digestPostJsonToPath(
+                    ip = ip,
+                    path = "/vapix/audiocontrol",
+                    username = username,
+                    password = password,
+                    json = JSONObject()
+                        .put("axac:GetControlCapabilities", JSONObject())
+                )
+
+            if (!capabilitiesResult.first) return null
+
+            val capabilitiesJson = JSONObject(capabilitiesResult.second)
+            val ranges = capabilitiesJson
+                .optJSONObject("Capabilities")
+                ?.optJSONObject("VolumeRanges")
+                ?: return null
+
+            val minVolume = ranges.optInt("MinValue", Int.MIN_VALUE)
+            val maxVolume = ranges.optInt("MaxValue", Int.MAX_VALUE)
+
+            if (
+                minVolume == Int.MIN_VALUE ||
+                maxVolume == Int.MAX_VALUE ||
+                maxVolume <= minVolume
+            ) return null
+
+            val volumeResult =
+                digestPostJsonToPath(
+                    ip = ip,
+                    path = "/vapix/audiocontrol",
+                    username = username,
+                    password = password,
+                    json = JSONObject()
+                        .put("axac:GetVolume", JSONObject())
+                )
+
+            if (!volumeResult.first) return null
+
+            val volume = JSONObject(volumeResult.second)
+                .optJSONObject("Volume")
+                ?: return null
+
+            if (!volume.has("ForegroundVolume")) return null
+
+            val currentVolume = volume.getInt("ForegroundVolume")
+            val muted = volume.optBoolean("ForegroundVolumeMute", false)
+
+            val currentPercent =
+                if (muted) 0
+                else nativeVolumeToPercent(
+                    currentVolume,
+                    minVolume,
+                    maxVolume
+                )
+
+            Log.d(
+                "AXIS_VOLUME",
+                "Using Audio Control: foreground=$currentVolume " +
+                        "range=$minVolume..$maxVolume percent=$currentPercent"
+            )
+
+            VolumeInfo(
+                deviceId = "",
+                outputId = "",
+                connectionTypeId = "",
+                signalingTypeId = "",
+                channelId = -1,
+                gainValues = emptyList(),
+                currentGain = currentVolume,
+                minGain = minVolume.toDouble(),
+                maxGain = maxVolume.toDouble(),
+                useAudioControl = true,
+                currentPercent = currentPercent,
+                masterMinVolume = minVolume,
+                masterMaxVolume = maxVolume
+            )
+        } catch (e: Exception) {
+            Log.d(
+                "AXIS_VOLUME",
+                "Audio Control detection failed: ${e.message}"
+            )
+            null
+        }
+    }
+
+    private fun setAudioControlVolume(
+        ip: String,
+        username: String,
+        password: String,
+        volumeInfo: VolumeInfo,
+        percent: Int,
+        callback: (Boolean, String) -> Unit
+    ) {
+        val safePercent = percent.coerceIn(0, 100)
+
+        val targetVolume =
+            percentToNativeVolume(
+                safePercent,
+                volumeInfo.masterMinVolume,
+                volumeInfo.masterMaxVolume
+            )
+
+        val request =
+            JSONObject()
+                .put(
+                    "axac:SetVolume",
+                    JSONObject()
+                        .put(
+                            "Volume",
+                            JSONObject()
+                                .put("ForegroundVolume", targetVolume)
+                                .put(
+                                    "ForegroundVolumeMute",
+                                    safePercent == 0
+                                )
+                        )
+                )
+
+        val result =
+            digestPostJsonToPath(
+                ip = ip,
+                path = "/vapix/audiocontrol",
+                username = username,
+                password = password,
+                json = request
+            )
+
+        if (!result.first) {
+            callback(false, "Volume error: ${result.second}")
+            return
+        }
+
+        Log.d(
+            "AXIS_VOLUME",
+            "Set Audio Control volume percent=$safePercent -> ${targetVolume}dB"
+        )
+
+        callback(true, "Volume $safePercent% | ${targetVolume}dB")
+    }
+
+    private fun percentToNativeVolume(
+        percent: Int,
+        min: Int,
+        max: Int
+    ): Int {
+        val safe = percent.coerceIn(0, 100)
+
+        return (
+                min +
+                        (max - min) * safe / 100.0
+                )
+            .roundToInt()
+            .coerceIn(min, max)
+    }
+
+    private fun nativeVolumeToPercent(
+        value: Int,
+        min: Int,
+        max: Int
+    ): Int {
+        if (max <= min) return 0
+
+        return (
+                100.0 *
+                        (value - min) /
+                        (max - min)
+                )
+            .roundToInt()
+            .coerceIn(0, 100)
+    }
+
+    /* =========================================================
        MODIFY ONLY OUTPUT GAIN
        ========================================================= */
 
     private fun changeOutputGain(
         devices: JSONArray,
         volumeInfo: VolumeInfo,
-        newGain: Int
+        newGain: Int,
+        mute: Boolean = false
     ): Boolean {
 
         for (d in 0 until devices.length()) {
@@ -911,12 +1132,9 @@ class AxisSpeakerClient {
                                     newGain
                                 )
 
-                                /*
-                                 * Keep output unmuted.
-                                 */
                                 channel.put(
                                     "mute",
-                                    false
+                                    mute
                                 )
 
                                 return true
@@ -1363,21 +1581,27 @@ class AxisSpeakerClient {
         password: String,
         json: JSONObject
     ): Pair<Boolean, String> {
+        return digestPostJsonToPath(
+            ip = ip,
+            path = "/axis-cgi/audiodevicecontrol.cgi",
+            username = username,
+            password = password,
+            json = json
+        )
+    }
 
-        val path =
-            "/axis-cgi/audiodevicecontrol.cgi"
+    private fun digestPostJsonToPath(
+        ip: String,
+        path: String,
+        username: String,
+        password: String,
+        json: JSONObject
+    ): Pair<Boolean, String> {
 
-        val url =
-            "http://$ip$path"
+        val url = "http://$ip$path"
 
-        /*
-         * First request obtains Digest challenge.
-         */
         val challengeBody =
-            "{}"
-                .toRequestBody(
-                    jsonMediaType
-                )
+            "{}".toRequestBody(jsonMediaType)
 
         val challengeRequest =
             Request.Builder()
@@ -1389,78 +1613,42 @@ class AxisSpeakerClient {
             .execute()
             .use { challengeResponse ->
 
-                /*
-                 * If authentication isn't required,
-                 * send the actual JSON directly.
-                 */
-                if (
-                    challengeResponse.isSuccessful
-                ) {
-
+                if (challengeResponse.isSuccessful) {
                     val directBody =
-                        json
-                            .toString()
-                            .toRequestBody(
-                                jsonMediaType
-                            )
+                        json.toString().toRequestBody(jsonMediaType)
 
                     val directRequest =
                         Request.Builder()
                             .url(url)
-                            .header(
-                                "Content-Type",
-                                "application/json"
-                            )
+                            .header("Content-Type", "application/json")
                             .post(directBody)
                             .build()
 
                     client.newCall(directRequest)
                         .execute()
                         .use { response ->
-
-                            val text =
-                                response.body
-                                    ?.string()
-                                    ?: ""
-
                             return Pair(
                                 response.isSuccessful,
-                                text
+                                response.body?.string() ?: ""
                             )
                         }
                 }
 
-                val code =
-                    challengeResponse.code
-
+                val code = challengeResponse.code
                 val authHeader =
-                    challengeResponse.header(
-                        "WWW-Authenticate"
-                    )
+                    challengeResponse.header("WWW-Authenticate")
 
-                if (
-                    code != 401 ||
-                    authHeader == null
-                ) {
-
-                    return Pair(
-                        false,
-                        "HTTP error: $code"
-                    )
+                if (code != 401 || authHeader == null) {
+                    return Pair(false, "HTTP error: $code")
                 }
 
                 val authorization =
                     createDigestAuthorization(
-                        header =
-                            authHeader,
-                        username =
-                            username,
-                        password =
-                            password,
-                        method =
-                            "POST",
-                        uri =
-                            path
+                        header = authHeader,
+                        username = username,
+                        password = password,
+                        method = "POST",
+                        uri = path
                     )
                         ?: return Pair(
                             false,
@@ -1468,38 +1656,22 @@ class AxisSpeakerClient {
                         )
 
                 val body =
-                    json
-                        .toString()
-                        .toRequestBody(
-                            jsonMediaType
-                        )
+                    json.toString().toRequestBody(jsonMediaType)
 
                 val request =
                     Request.Builder()
                         .url(url)
-                        .header(
-                            "Authorization",
-                            authorization
-                        )
-                        .header(
-                            "Content-Type",
-                            "application/json"
-                        )
+                        .header("Authorization", authorization)
+                        .header("Content-Type", "application/json")
                         .post(body)
                         .build()
 
                 client.newCall(request)
                     .execute()
                     .use { response ->
-
-                        val text =
-                            response.body
-                                ?.string()
-                                ?: ""
-
                         return Pair(
                             response.isSuccessful,
-                            text
+                            response.body?.string() ?: ""
                         )
                     }
             }

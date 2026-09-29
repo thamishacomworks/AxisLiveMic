@@ -138,6 +138,24 @@ fun AxisLiveMicScreen() {
         remember {
             AxisAudioStreamer()
         }
+
+    val recordingManager =
+        remember {
+            RecordingManager(context)
+        }
+
+    var saveRecording by remember {
+        mutableStateOf(false)
+    }
+
+    var recordingName by remember {
+        mutableStateOf("")
+    }
+
+    var savedRecordings by remember {
+        mutableStateOf(recordingManager.getRecordings())
+    }
+
     var speakerIp by remember {
         mutableStateOf(
             preferences.getString(
@@ -514,6 +532,15 @@ fun AxisLiveMicScreen() {
                         modifier = Modifier.weight(1f),
                         micOn = micOn,
                         connected = speakerConnected,
+                        saveRecording = saveRecording,
+                        onSaveRecordingChange = {
+                            saveRecording = it
+                        },
+
+                        recordingName = recordingName,
+                        onRecordingNameChange = {
+                            recordingName = it
+                        },
 
                         onMicOn = {
 
@@ -526,19 +553,49 @@ fun AxisLiveMicScreen() {
 
                                 connectionStatus = "Starting audio stream..."
 
+                                val wideband =
+                                    axisSpeakerClient.supportsWideband
+
+                                val sampleRate =
+                                    if (wideband) 16000 else 8000
+
                                 audioStreamer.start(
                                     ip = speakerIp.trim(),
                                     username = username,
-                                    password = password
+                                    password = password,
+                                    contentType =
+                                        if (wideband) "audio/axis-mulaw-128"
+                                        else "audio/basic"
                                 ) { message ->
                                     connectionStatus = message
                                 }
 
                                 delay(500)
 
+                                if (saveRecording) {
+
+                                    recordingManager.startRecording(
+                                        sampleRate = sampleRate,
+                                        recordingName = recordingName
+                                    )
+                                }
+
+                                val voiceProcessor =
+                                    VoiceProcessor(sampleRate)
+
                                 val started =
-                                    micRecorder.startRecording { pcmData ->
+                                    micRecorder.startRecording(sampleRate) { rawPcm ->
+
+                                        val pcmData =
+                                            voiceProcessor.process(rawPcm)
+
+                                        // Live sound -> AXIS
                                         audioStreamer.sendPcm(pcmData)
+
+                                        // Save only when checkbox is ON
+                                        if (saveRecording) {
+                                            recordingManager.writePcm(pcmData)
+                                        }
                                     }
 
                                 if (started) {
@@ -565,14 +622,153 @@ fun AxisLiveMicScreen() {
                             micRecorder.stopRecording()
                             audioStreamer.stop()
 
+                            if (saveRecording) {
+                                recordingManager.stopRecording()
+
+                                savedRecordings =
+                                    recordingManager.getRecordings()
+                            }
+
                             micOn = false
 
                             connectionStatus =
-                                "Microphone stopped"
+                                if (saveRecording) {
+                                    "Microphone stopped - Recording saved"
+                                } else {
+                                    "Microphone stopped"
+                                }
                         }
                     )
                 }
             }
+
+            Spacer(
+                modifier = Modifier.height(18.dp)
+            )
+
+            SavedRecordingsCard(
+                recordings = savedRecordings,
+
+                onPlay = { file ->
+
+                    if (!speakerConnected) {
+
+                        connectionStatus =
+                            "Connect to AXIS speaker first"
+
+                    } else {
+
+                        scope.launch {
+
+                            try {
+
+                                val wav = file.readBytes()
+
+                                if (wav.size <= 44) {
+                                    connectionStatus =
+                                        "Invalid recording"
+                                    return@launch
+                                }
+
+                                // Read actual sample rate from WAV header
+                                val playbackSampleRate =
+                                    (wav[24].toInt() and 0xFF) or
+                                            ((wav[25].toInt() and 0xFF) shl 8) or
+                                            ((wav[26].toInt() and 0xFF) shl 16) or
+                                            ((wav[27].toInt() and 0xFF) shl 24)
+
+                                val wideband =
+                                    playbackSampleRate >= 16000
+
+                                connectionStatus =
+                                    "Playing recording..."
+
+                                audioStreamer.start(
+                                    ip = speakerIp.trim(),
+                                    username = username,
+                                    password = password,
+                                    contentType =
+                                        if (wideband)
+                                            "audio/axis-mulaw-128"
+                                        else
+                                            "audio/basic"
+                                ) { message ->
+
+                                    connectionStatus = message
+                                }
+
+                                delay(500)
+
+                                Thread {
+
+                                    try {
+
+                                        var offset = 44
+
+                                        // PCM16 mono
+                                        // Correct amount of audio for 20 ms
+                                        val chunkSize =
+                                            playbackSampleRate *
+                                                    2 *
+                                                    20 / 1000
+
+                                        while (offset < wav.size) {
+
+                                            val end =
+                                                minOf(
+                                                    offset + chunkSize,
+                                                    wav.size
+                                                )
+
+                                            val pcm =
+                                                wav.copyOfRange(
+                                                    offset,
+                                                    end
+                                                )
+
+                                            audioStreamer.sendPcm(pcm)
+
+                                            offset = end
+
+                                            Thread.sleep(20)
+                                        }
+
+                                        Thread.sleep(300)
+
+                                        audioStreamer.stop()
+
+                                        connectionStatus =
+                                            "Recording playback finished"
+
+                                    } catch (e: Exception) {
+
+                                        audioStreamer.stop()
+
+                                        connectionStatus =
+                                            "Playback failed: ${e.message}"
+                                    }
+
+                                }.start()
+
+                            } catch (e: Exception) {
+
+                                audioStreamer.stop()
+
+                                connectionStatus =
+                                    "Playback failed: ${e.message}"
+                            }
+                        }
+                    }
+                },
+
+                onDelete = { file ->
+
+                    recordingManager.deleteRecording(file)
+
+                    savedRecordings =
+                        recordingManager.getRecordings()
+                }
+            )
         }
     }
 }
@@ -979,7 +1175,7 @@ fun VolumeCard(
             ) {
 
                 Text(
-                    text = "🔈",
+                    text = if (volume.roundToInt() == 0) "🔇" else "🔈",
                     fontSize = 20.sp
                 )
 
@@ -1003,10 +1199,7 @@ fun VolumeCard(
                             )
                 )
 
-                Text(
-                    text = "🔊",
-                    fontSize = 20.sp
-                )
+
             }
         }
     }
@@ -1021,6 +1214,10 @@ fun MicrophoneCard(
     modifier: Modifier = Modifier,
     micOn: Boolean,
     connected: Boolean,
+    saveRecording: Boolean,
+    onSaveRecordingChange: (Boolean) -> Unit,
+    recordingName: String,
+    onRecordingNameChange: (String) -> Unit,
     onMicOn: () -> Unit,
     onMicOff: () -> Unit
 ) {
@@ -1061,6 +1258,36 @@ fun MicrophoneCard(
             )
 
             Spacer(modifier = Modifier.height(24.dp))
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Checkbox(
+                    checked = saveRecording,
+                    onCheckedChange = onSaveRecordingChange,
+                    enabled = !micOn
+                )
+
+                Text(
+                    text = "Save Recording",
+                    color = TextPrimary
+                )
+            }
+
+            if (saveRecording) {
+
+                Spacer(
+                    modifier = Modifier.height(12.dp)
+                )
+
+                DarkTextField(
+                    value = recordingName,
+                    onValueChange = onRecordingNameChange,
+                    label = "Recording Name"
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1185,6 +1412,86 @@ fun StatusCard(
                     fontSize =
                         14.sp
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun SavedRecordingsCard(
+    recordings: List<java.io.File>,
+    onPlay: (java.io.File) -> Unit,
+    onDelete: (java.io.File) -> Unit
+) {
+
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = CardBackground
+        ),
+        shape = RoundedCornerShape(22.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+
+        Column(
+            modifier = Modifier.padding(20.dp)
+        ) {
+
+            Text(
+                text = "SAVED RECORDINGS",
+                color = TextSecondary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+
+
+            Spacer(
+                modifier = Modifier.height(14.dp)
+            )
+
+            if (recordings.isEmpty()) {
+
+                Text(
+                    text = "No recordings saved",
+                    color = TextSecondary
+                )
+
+            } else {
+
+                recordings.forEach { file ->
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp),
+                        verticalAlignment =
+                            Alignment.CenterVertically
+                    ) {
+
+                        Text(
+                            text =
+                                file.nameWithoutExtension,
+                            color = TextPrimary,
+                            modifier =
+                                Modifier.weight(1f)
+                        )
+
+                        TextButton(
+                            onClick = {
+                                onPlay(file)
+                            }
+                        ) {
+                            Text("▶ PLAY")
+                        }
+
+                        TextButton(
+                            onClick = {
+                                onDelete(file)
+                            }
+                        ) {
+                            Text("DELETE")
+                        }
+                    }
+                }
             }
         }
     }
