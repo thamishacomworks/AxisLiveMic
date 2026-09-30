@@ -148,6 +148,14 @@ fun AxisLiveMicScreen() {
         mutableStateOf(false)
     }
 
+    var playingFile by remember {
+        mutableStateOf<java.io.File?>(null)
+    }
+
+    var playbackPaused by remember {
+        mutableStateOf(false)
+    }
+
     var recordingName by remember {
         mutableStateOf("")
     }
@@ -581,7 +589,18 @@ fun AxisLiveMicScreen() {
                                 }
 
                                 val voiceProcessor =
-                                    VoiceProcessor(sampleRate)
+                                    VoiceProcessor(sampleRate) { overloaded ->
+                                        scope.launch {
+                                            if (micOn) {
+                                                connectionStatus =
+                                                    if (overloaded) {
+                                                        "Mic too close - move the tablet back"
+                                                    } else {
+                                                        "LIVE - Microphone transmitting"
+                                                    }
+                                            }
+                                        }
+                                    }
 
                                 val started =
                                     micRecorder.startRecording(sampleRate) { rawPcm ->
@@ -648,120 +667,189 @@ fun AxisLiveMicScreen() {
 
             SavedRecordingsCard(
                 recordings = savedRecordings,
+                playingFile = playingFile,
+                playbackPaused = playbackPaused,
 
-                onPlay = { file ->
+                onPlayPause = { file ->
 
                     if (!speakerConnected) {
-
                         connectionStatus =
                             "Connect to AXIS speaker first"
-
                     } else {
 
-                        scope.launch {
+                        // 1. Currently playing -> PAUSE
+                        if (
+                            playingFile?.absolutePath == file.absolutePath &&
+                            !playbackPaused
+                        ) {
+                            playbackPaused = true
+                            connectionStatus = "Recording paused"
+                        }
 
-                            try {
+                        // 2. Currently paused -> RESUME
+                        else if (
+                            playingFile?.absolutePath == file.absolutePath &&
+                            playbackPaused
+                        ) {
+                            playbackPaused = false
+                            connectionStatus = "Playing recording..."
+                        }
 
-                                val wav = file.readBytes()
+                        // 3. Start a new recording
+                        else {
 
-                                if (wav.size <= 44) {
-                                    connectionStatus =
-                                        "Invalid recording"
-                                    return@launch
-                                }
+                            playingFile = file
+                            playbackPaused = false
 
-                                // Read actual sample rate from WAV header
-                                val playbackSampleRate =
-                                    (wav[24].toInt() and 0xFF) or
-                                            ((wav[25].toInt() and 0xFF) shl 8) or
-                                            ((wav[26].toInt() and 0xFF) shl 16) or
-                                            ((wav[27].toInt() and 0xFF) shl 24)
+                            scope.launch {
 
-                                val wideband =
-                                    playbackSampleRate >= 16000
+                                try {
 
-                                connectionStatus =
-                                    "Playing recording..."
+                                    val wav = file.readBytes()
 
-                                audioStreamer.start(
-                                    ip = speakerIp.trim(),
-                                    username = username,
-                                    password = password,
-                                    contentType =
-                                        if (wideband)
-                                            "audio/axis-mulaw-128"
-                                        else
-                                            "audio/basic"
-                                ) { message ->
-
-                                    connectionStatus = message
-                                }
-
-                                delay(500)
-
-                                Thread {
-
-                                    try {
-
-                                        var offset = 44
-
-                                        // PCM16 mono
-                                        // Correct amount of audio for 20 ms
-                                        val chunkSize =
-                                            playbackSampleRate *
-                                                    2 *
-                                                    20 / 1000
-
-                                        while (offset < wav.size) {
-
-                                            val end =
-                                                minOf(
-                                                    offset + chunkSize,
-                                                    wav.size
-                                                )
-
-                                            val pcm =
-                                                wav.copyOfRange(
-                                                    offset,
-                                                    end
-                                                )
-
-                                            audioStreamer.sendPcm(pcm)
-
-                                            offset = end
-
-                                            Thread.sleep(20)
-                                        }
-
-                                        Thread.sleep(300)
-
-                                        audioStreamer.stop()
-
+                                    if (wav.size <= 44) {
+                                        playingFile = null
+                                        playbackPaused = false
                                         connectionStatus =
-                                            "Recording playback finished"
-
-                                    } catch (e: Exception) {
-
-                                        audioStreamer.stop()
-
-                                        connectionStatus =
-                                            "Playback failed: ${e.message}"
+                                            "Invalid recording"
+                                        return@launch
                                     }
 
-                                }.start()
+                                    // Read sample rate from WAV
+                                    val playbackSampleRate =
+                                        (wav[24].toInt() and 0xFF) or
+                                                ((wav[25].toInt() and 0xFF) shl 8) or
+                                                ((wav[26].toInt() and 0xFF) shl 16) or
+                                                ((wav[27].toInt() and 0xFF) shl 24)
 
-                            } catch (e: Exception) {
+                                    val wideband =
+                                        playbackSampleRate >= 16000
 
-                                audioStreamer.stop()
+                                    connectionStatus =
+                                        "Playing recording..."
 
-                                connectionStatus =
-                                    "Playback failed: ${e.message}"
+                                    // Stop previous stream first
+                                    audioStreamer.stop()
+
+                                    audioStreamer.start(
+                                        ip = speakerIp.trim(),
+                                        username = username,
+                                        password = password,
+                                        contentType =
+                                            if (wideband) {
+                                                "audio/axis-mulaw-128"
+                                            } else {
+                                                "audio/basic"
+                                            }
+                                    ) { message ->
+                                        connectionStatus = message
+                                    }
+
+                                    delay(500)
+
+                                    Thread {
+
+                                        try {
+
+                                            var offset = 44
+
+                                            // PCM16 mono - 20 ms
+                                            val chunkSize =
+                                                playbackSampleRate *
+                                                        2 *
+                                                        20 / 1000
+
+                                            while (
+                                                offset < wav.size &&
+                                                playingFile?.absolutePath ==
+                                                file.absolutePath
+                                            ) {
+
+                                                // PAUSE
+                                                if (playbackPaused) {
+                                                    Thread.sleep(20)
+                                                    continue
+                                                }
+
+                                                val end =
+                                                    minOf(
+                                                        offset + chunkSize,
+                                                        wav.size
+                                                    )
+
+                                                val pcm =
+                                                    wav.copyOfRange(
+                                                        offset,
+                                                        end
+                                                    )
+
+                                                audioStreamer.sendPcm(pcm)
+
+                                                offset = end
+
+                                                Thread.sleep(20)
+                                            }
+
+                                            // Recording finished normally
+                                            if (
+                                                playingFile?.absolutePath ==
+                                                file.absolutePath
+                                            ) {
+
+                                                Thread.sleep(300)
+
+                                                audioStreamer.stop()
+
+                                                playingFile = null
+                                                playbackPaused = false
+
+                                                connectionStatus =
+                                                    "Recording playback finished"
+                                            }
+
+                                        } catch (e: Exception) {
+
+                                            audioStreamer.stop()
+
+                                            playingFile = null
+                                            playbackPaused = false
+
+                                            connectionStatus =
+                                                "Playback failed: ${e.message}"
+                                        }
+
+                                    }.apply {
+                                        name = "RecordingPlaybackThread"
+                                        start()
+                                    }
+
+                                } catch (e: Exception) {
+
+                                    audioStreamer.stop()
+
+                                    playingFile = null
+                                    playbackPaused = false
+
+                                    connectionStatus =
+                                        "Playback failed: ${e.message}"
+                                }
                             }
                         }
                     }
                 },
 
                 onDelete = { file ->
+
+                    // If this recording is playing,
+                    // stop it before deleting.
+                    if (
+                        playingFile?.absolutePath ==
+                        file.absolutePath
+                    ) {
+                        audioStreamer.stop()
+                        playingFile = null
+                        playbackPaused = false
+                    }
 
                     recordingManager.deleteRecording(file)
 
@@ -1420,7 +1508,9 @@ fun StatusCard(
 @Composable
 fun SavedRecordingsCard(
     recordings: List<java.io.File>,
-    onPlay: (java.io.File) -> Unit,
+    playingFile: java.io.File?,
+    playbackPaused: Boolean,
+    onPlayPause: (java.io.File) -> Unit,
     onDelete: (java.io.File) -> Unit
 ) {
 
@@ -1475,12 +1565,22 @@ fun SavedRecordingsCard(
                                 Modifier.weight(1f)
                         )
 
+                        val isThisPlaying =
+                            playingFile?.absolutePath == file.absolutePath &&
+                                    !playbackPaused
+
                         TextButton(
                             onClick = {
-                                onPlay(file)
+                                onPlayPause(file)
                             }
                         ) {
-                            Text("▶ PLAY")
+                            Text(
+                                if (isThisPlaying) {
+                                    "⏸ PAUSE"
+                                } else {
+                                    "▶ PLAY"
+                                }
+                            )
                         }
 
                         TextButton(

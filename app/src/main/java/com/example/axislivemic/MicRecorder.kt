@@ -157,7 +157,14 @@ class MicRecorder(
         sampleRate: Int,
         minBufferSize: Int
     ): AudioRecord? {
-
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.e("MicRecorder", "RECORD_AUDIO permission not granted")
+            return null
+        }
         return try {
 
             val recorder = AudioRecord(
@@ -182,23 +189,79 @@ class MicRecorder(
 
     private fun enableVoiceEffects(sessionId: Int) {
 
+        // Automatic Gain Control check
         try {
-            if (AutomaticGainControl.isAvailable()) {
+            val agcAvailable = AutomaticGainControl.isAvailable()
+
+            Log.d(
+                "AXIS_AUDIO",
+                "AGC available=$agcAvailable"
+            )
+
+            if (agcAvailable) {
+
                 agc = AutomaticGainControl.create(sessionId)
-                    ?.apply { enabled = true }
+
+                Log.d(
+                    "AXIS_AUDIO",
+                    "AGC created=${agc != null}"
+                )
+
+                agc?.enabled = true
+
+                Log.d(
+                    "AXIS_AUDIO",
+                    "AGC enabled=${agc?.enabled}"
+                )
             }
-        } catch (_: Exception) {
+
+        } catch (e: Exception) {
+
+            Log.e(
+                "AXIS_AUDIO",
+                "AGC error",
+                e
+            )
         }
 
+
+        // Android built-in Noise Suppressor check
         try {
-            if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = NoiseSuppressor.create(sessionId)
-                    ?.apply { enabled = true }
+
+            val nsAvailable = NoiseSuppressor.isAvailable()
+
+            Log.d(
+                "AXIS_AUDIO",
+                "NoiseSuppressor available=$nsAvailable"
+            )
+
+            if (nsAvailable) {
+
+                noiseSuppressor =
+                    NoiseSuppressor.create(sessionId)
+
+                Log.d(
+                    "AXIS_AUDIO",
+                    "NoiseSuppressor created=${noiseSuppressor != null}"
+                )
+
+                noiseSuppressor?.enabled = true
+
+                Log.d(
+                    "AXIS_AUDIO",
+                    "NoiseSuppressor enabled=${noiseSuppressor?.enabled}"
+                )
             }
-        } catch (_: Exception) {
+
+        } catch (e: Exception) {
+
+            Log.e(
+                "AXIS_AUDIO",
+                "NoiseSuppressor error",
+                e
+            )
         }
     }
-
     private fun releaseEffects() {
 
         try {
